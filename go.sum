@@ -1,0 +1,4 @@
+git.silverwhisper.pl/golang-common-modules/log v0.2.0 h1:h/BIYzmrWiAYeZ7W6prIZCFuul4jjqFtZNGc3jTLCM8=
+git.silverwhisper.pl/golang-common-modules/log v0.2.0/go.mod h1:y2TTuCF9kHQjKRZzSbJZe9F8fHX1MDOtOFIhDcT8xOY=
+github.com/rabbitmq/amqp091-go v1.10.0 h1:STpn5XsHlHGcecLmMFCtg7mqq0RnD+zFr4uzukfVhBw=
+github.com/rabbitmq/amqp091-go v1.10.0/go.mod h1:Hy4jKW5kQART1u+JkDTF9YYOQUHXqMuhrgxOEeS7G4o=
