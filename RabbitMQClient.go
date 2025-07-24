@@ -60,7 +60,7 @@ func (mq *RabbitMQClient) Consume(context context.Context, queue RabbitMQQueue, 
 				return
 			}
 
-			c := newInternalRabbitMQConnection(mq.l, context, mq.connectionString, prefetchCount)
+			c := newInternalRabbitMQConnection(mq.l, context, mq.connectionString, prefetchCount, nil)
 			mq.l.Info("Connecting to `{_target}` by consumer '{_consumer}'...", log.Data{
 				"_target":   log.Str(mq.connectionString),
 				"_consumer": log.Str(consumer),
@@ -147,6 +147,7 @@ func (mq *RabbitMQClient) Publish(context context.Context, publisher string) cha
 	outgoingPublicationChannel := make(chan Publication)
 
 	go func() {
+		var publicationRetry *Publication = nil
 		for {
 			if context.Err() != nil {
 				mq.l.Info("Publish '{_target}' by publisher '{_publisher}' stopped: {_error}", log.Data{
@@ -158,7 +159,7 @@ func (mq *RabbitMQClient) Publish(context context.Context, publisher string) cha
 				return
 			}
 
-			c := newInternalRabbitMQConnection(mq.l, context, mq.connectionString, 0)
+			c := newInternalRabbitMQConnection(mq.l, context, mq.connectionString, 0, publicationRetry)
 			mq.l.Info("Connecting to `{_target}` by publisher '{_publisher}'...", log.Data{
 				"_target":    log.Str(mq.connectionString),
 				"_publisher": log.Str(publisher),
@@ -184,6 +185,7 @@ func (mq *RabbitMQClient) Publish(context context.Context, publisher string) cha
 
 			mq.outputQueueLoop(outgoingPublicationChannel, connectionErrorCh, producerId, c, context)
 
+			publicationRetry = c.publicationRetry
 			c.cleanup()
 		}
 	}()
@@ -192,6 +194,38 @@ func (mq *RabbitMQClient) Publish(context context.Context, publisher string) cha
 }
 
 func (mq *RabbitMQClient) outputQueueLoop(outgoingPublicationChannel chan Publication, connectionErrorCh chan *amqp.Error, publisher string, c *internalRabbitMQConnection, context context.Context) {
+	if c.publicationRetry != nil {
+		msg := *c.publicationRetry
+		err := c.ch.Publish(msg.Exchange, msg.Key, false, false, amqp.Publishing{
+			Headers:         msg.Headers,
+			ContentType:     msg.ContentType,
+			ContentEncoding: msg.ContentEncoding,
+			DeliveryMode:    1,
+			Priority:        0,
+			CorrelationId:   msg.CorrelationId,
+			ReplyTo:         "",
+			Expiration:      "",
+			MessageId:       "",
+			Timestamp:       time.Time{},
+			Type:            "",
+			UserId:          "",
+			AppId:           publisher,
+			Body:            msg.Body,
+		})
+		if err != nil {
+			mq.l.Error("Retry publish on '{_target}' to '{_exchange}' by publisher '{_publisher}' error: {_error} (reconnect asap...)", log.Data{
+				"_target":        log.Str(mq.connectionString),
+				"_publisher":     log.Str(publisher),
+				"_exchange":      log.Str(msg.Exchange),
+				"_error":         log.Err(err),
+				"_reconnectTime": log.Int(mq.reconnectTime.Milliseconds()),
+			})
+			c.publicationRetry = &msg
+			return
+		}
+		c.publicationRetry = nil
+	}
+
 	for {
 		select {
 		case msg := <-outgoingPublicationChannel:
@@ -212,15 +246,17 @@ func (mq *RabbitMQClient) outputQueueLoop(outgoingPublicationChannel chan Public
 				Body:            msg.Body,
 			})
 			if err != nil {
-				mq.l.Error("Publish on '{_target}' by publisher '{_publisher}' error: {_error} (reconnect asap...)", log.Data{
+				mq.l.Error("Publish on '{_target}' to '{_exchange}' by publisher '{_publisher}' error: {_error} (reconnect asap...)", log.Data{
 					"_target":        log.Str(mq.connectionString),
+					"_exchange":      log.Str(msg.Exchange),
 					"_publisher":     log.Str(publisher),
 					"_error":         log.Err(err),
 					"_reconnectTime": log.Int(mq.reconnectTime.Milliseconds()),
 				})
-				// todo: we lost this message :-/
+				c.publicationRetry = &msg
 				return
 			}
+			c.publicationRetry = nil
 		case e := <-connectionErrorCh:
 			if e != nil {
 				mq.l.Error("Connection on '{_target}' by publisher '{_publisher}' closed: {_error} (reconnect asap...)", log.Data{
@@ -247,15 +283,19 @@ type internalRabbitMQConnection struct {
 
 	connectionString string
 	prefetchCount    int
+
+	publicationRetry *Publication
 }
 
-func newInternalRabbitMQConnection(l log.Logger, ctx context.Context, connectionString string, prefetchCount int) *internalRabbitMQConnection {
-	return &internalRabbitMQConnection{l: l, ctx: ctx, connectionString: connectionString, prefetchCount: prefetchCount}
+func newInternalRabbitMQConnection(l log.Logger, ctx context.Context, connectionString string, prefetchCount int, publicationRetry *Publication) *internalRabbitMQConnection {
+	return &internalRabbitMQConnection{l: l, ctx: ctx, connectionString: connectionString, prefetchCount: prefetchCount, publicationRetry: publicationRetry}
 }
 
 func (i *internalRabbitMQConnection) connect() error {
 	i.l.Info("Dial to {_rabbitmq}...", log.Data{"_rabbitmq": log.Str(i.connectionString)})
-	conn, err := amqp.Dial(i.connectionString)
+	conn, err := amqp.DialConfig(i.connectionString, amqp.Config{
+		Heartbeat:       10 * time.Second,
+	})
 	if err != nil {
 		return fmt.Errorf("dial to '%s' error: %w", i.connectionString, err)
 	}
