@@ -3,7 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
-	"git.silverwhisper.pl/golang-common-modules/log"
+	"git.silverbullet.pl/golang-common-modules/log"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"testing"
 	"time"

@@ -3,7 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
-	"git.silverwhisper.pl/golang-common-modules/log"
+	"git.silverbullet.pl/golang-common-modules/log"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"strings"
 	"sync"
@@ -294,7 +294,7 @@ func newInternalRabbitMQConnection(l log.Logger, ctx context.Context, connection
 func (i *internalRabbitMQConnection) connect() error {
 	i.l.Info("Dial to {_rabbitmq}...", log.Data{"_rabbitmq": log.Str(i.connectionString)})
 	conn, err := amqp.DialConfig(i.connectionString, amqp.Config{
-		Heartbeat:       10 * time.Second,
+		Heartbeat: 10 * time.Second,
 	})
 	if err != nil {
 		return fmt.Errorf("dial to '%s' error: %w", i.connectionString, err)
