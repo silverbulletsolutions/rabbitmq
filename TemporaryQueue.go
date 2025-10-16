@@ -2,18 +2,20 @@ package rabbitmq
 
 import (
 	"fmt"
+
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type TemporaryQueue struct {
 	queueName string
+	exclusive bool
 	bindings  []TemporaryQueueBinding
 	args      amqp.Table
 }
 
 func (q *TemporaryQueue) InitializeQueue(channel *amqp.Channel) (amqp.Queue, error) {
 
-	queue, err := channel.QueueDeclare(q.queueName, false, true, true, false, q.args)
+	queue, err := channel.QueueDeclare(q.queueName, false, true, q.exclusive, false, q.args)
 	if err != nil {
 		return amqp.Queue{}, fmt.Errorf("queue '%s' declare error: %w", q.queueName, err)
 	}
@@ -28,12 +30,15 @@ func (q *TemporaryQueue) InitializeQueue(channel *amqp.Channel) (amqp.Queue, err
 	return queue, nil
 }
 
-func NewTemporaryQueue() *TemporaryQueue {
-	return &TemporaryQueue{}
+func UseTemporaryQueue(name string) *TemporaryQueue {
+	return &TemporaryQueue{
+		queueName: name,
+		exclusive: true,
+	}
 }
 
-func (q *TemporaryQueue) Name(queueName string) *TemporaryQueue {
-	q.queueName = queueName
+func (q *TemporaryQueue) NoExclusive() *TemporaryQueue {
+	q.exclusive = false
 	return q
 }
 
