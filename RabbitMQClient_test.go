@@ -261,7 +261,7 @@ func TestRabbitMQClient_PublishWithMultipleConsumers(t *testing.T) {
 
 func consumerWorker(logger log.Logger, consumerName string, queueConsumer <-chan amqp.Delivery, ctx context.Context, f func(consumerName string, m publishWithReconnectMsg)) func() {
 	return func() {
-		logger.Info("Starting consumer loop...", log.Data{})
+		logger.Info("Starting consumer loop {consumer}...", log.Data{"consumer": log.Str(consumerName)})
 		for {
 			select {
 			case ev := <-queueConsumer:
@@ -272,7 +272,10 @@ func consumerWorker(logger log.Logger, consumerName string, queueConsumer <-chan
 				f(consumerName, m)
 
 				logger.Info("Received message: {_body}... done", log.Data{"_body": log.Str(ev.Body), "consumer": log.Str(consumerName)})
-				_ = ev.Ack(false)
+				err := ev.Ack(false)
+				if err != nil {
+					logger.Error("Ack error: {err}", log.Data{"err": log.Str(err.Error())})
+				}
 			case <-ctx.Done():
 				logger.Info("Consumer loop done", log.Data{"consumer": log.Str(consumerName)})
 				return
@@ -287,41 +290,48 @@ func TestRabbitMQClient_PublishWithReconnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
 	defer cancel()
 
-	mqSend := NewRabbitMQClient(logger, "localhost:5672", 1*time.Second, "test-client")
-	mqRecv := NewRabbitMQClient(logger, "genai.sbs.local:5672", 1*time.Second, "test-client")
+	mqSend := NewRabbitMQClient(logger, "localhost:5672", 1*time.Second, "test-server")
+	mqRecv := NewRabbitMQClient(logger, "localhost:5672", 1*time.Second, "test-client")
 
-	var queueName = "test.queue." + t.Name() + "_" + time.Now().Format("20060102_150405")
+	var queueName = "test.queue"
 
-	queueConsumer := mqRecv.Consume(ctx, UseTemporaryQueue(queueName).NoExclusive(), "superConsumer", 7, false, nil)
+	queueConsumer := mqRecv.Consume(ctx, UseExistingQueue(queueName), "superConsumer", 7, false, nil)
 
-	const publishMessageCount int = 20
+	const publishMessageCount int = 7
 
 	out := mqSend.Publish(ctx, "super-publisher")
 
 	var count atomic.Int32
 	var wg sync.WaitGroup
 
-	wg.Go(consumerWorker(logger, "consumer", queueConsumer, ctx, func(consumerName string, m publishWithReconnectMsg) {
-		count.Add(1)
+	for id := range 2 {
+		wg.Go(consumerWorker(logger, fmt.Sprintf("consumer-%d", id), queueConsumer, ctx, func(consumerName string, m publishWithReconnectMsg) {
+			count.Add(1)
 
-		if m.Id >= publishMessageCount {
-			return
-		}
+			if m.Id >= publishMessageCount {
+				return
+			}
 
-		time.Sleep(2 * time.Second)
-		newId := m.Id + 1
-		body, _ := json.Marshal(publishWithReconnectMsg{Id: newId})
-		logger.Info("Sending message '{_body}'...", log.Data{"_body": log.Str(body)})
-		out <- Publication{
-			Key:           queueName,
-			Body:          body,
-			CorrelationId: fmt.Sprintf("publication-%d", newId),
-		}
-		logger.Info("Sending message '{_body}'... done", log.Data{"_body": log.Str(body)})
+			processingStart := time.Now()
+			logger.Info("Received message: {_body}...", log.Data{"_body": log.Int(m.Id)})
 
-	}))
+			time.Sleep(time.Duration(id%3+4) * time.Second)
+			newId := m.Id + 1
+			body, _ := json.Marshal(publishWithReconnectMsg{Id: newId})
+			logger.Info("Sending message '{_body}'...", log.Data{"_body": log.Str(body)})
+			out <- Publication{
+				Key:           queueName,
+				Body:          body,
+				CorrelationId: fmt.Sprintf("publication-%d", newId),
+			}
+			logger.Info("Sending message '{_body}'... done", log.Data{"_body": log.Str(body)})
 
-	time.Sleep(100 * time.Millisecond) // wait for initialization of queue
+			processingTime := time.Since(processingStart).Milliseconds()
+			logger.Info("Received message: {_body}... done (in {processingTime}ms)", log.Data{"_body": log.Int(m.Id), "processingTime": log.Int(processingTime)})
+		}))
+	}
+
+	time.Sleep(500 * time.Millisecond) // wait for initialization of queue
 
 	body, _ := json.Marshal(publishWithReconnectMsg{Id: 1})
 	logger.Info("Sending message '{_body}'...", log.Data{"_body": log.Str(body)})
