@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"git.silverbullet.pl/golang-common-modules/log"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/silverbulletsolutions/log"
 )
 
 type RabbitMQClient struct {

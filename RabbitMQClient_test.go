@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"git.silverbullet.pl/golang-common-modules/log"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/silverbulletsolutions/log"
 )
 
 func TestRabbitMQClient_Consume(t *testing.T) {
