@@ -175,62 +175,56 @@ func (mq *RabbitMQClient) Consume(context context.Context, queue RabbitMQQueue, 
 	return outgoingResponseChannel
 }
 
-type Publication struct {
-	Exchange        string
-	Key             string
-	Headers         amqp.Table
-	CorrelationId   string
-	ContentEncoding string
-	ContentType     string
-	Body            []byte
+func (mq *RabbitMQClient) NewPublisher(name string) *Publisher {
+	return newPublisher(mq, name)
 }
 
-func (mq *RabbitMQClient) Publish(context context.Context, publisher string) chan<- Publication {
+// legacyPublishShutdownTimeout bounds sending of messages accepted before context of Publish was done
+const legacyPublishShutdownTimeout = 5 * time.Second
 
+// Publish returns channel for publishing messages; publishing stops when ctx is done.
+// The returned channel is never closed (senders would panic) - messages sent after ctx is done are dropped and logged.
+//
+// Deprecated: use NewPublisher - it reports publish errors to the caller and supports graceful shutdown.
+func (mq *RabbitMQClient) Publish(ctx context.Context, publisher string) chan<- Publication {
 	outgoingPublicationChannel := make(chan Publication)
 
+	p := mq.NewPublisher(publisher)
+
 	go func() {
-		var publicationRetry *Publication = nil
 		for {
-			if context.Err() != nil {
+			select {
+			case msg := <-outgoingPublicationChannel:
+				err := p.Publish(ctx, msg)
+				if err != nil {
+					mq.l.Error("Publish message '{correlationId}' to '{_target}' exchange '{_exchange}' by publisher '{_publisher}' error: {_error}", log.Data{
+						"_target":       log.Str(mq.maskedTarget),
+						"_publisher":    log.Str(publisher),
+						"_exchange":     log.Str(msg.Exchange),
+						"_error":        log.Err(err),
+						"correlationId": log.Str(msg.CorrelationId),
+					})
+				}
+			case <-ctx.Done():
 				mq.l.Info("Publish '{_target}' by publisher '{_publisher}' stopped: {_error}", log.Data{
 					"_target":    log.Str(mq.maskedTarget),
 					"_publisher": log.Str(publisher),
-					"_error":     log.Err(context.Err()),
+					"_error":     log.Err(ctx.Err()),
 				})
-				close(outgoingPublicationChannel)
-				return
+
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), legacyPublishShutdownTimeout)
+				p.Shutdown(shutdownCtx)
+				cancel()
+
+				for msg := range outgoingPublicationChannel {
+					mq.l.Warn("Message '{correlationId}' to '{_target}' exchange '{_exchange}' dropped - publisher '{_publisher}' stopped", log.Data{
+						"_target":       log.Str(mq.maskedTarget),
+						"_publisher":    log.Str(publisher),
+						"_exchange":     log.Str(msg.Exchange),
+						"correlationId": log.Str(msg.CorrelationId),
+					})
+				}
 			}
-
-			c := newInternalRabbitMQConnection(mq.l, context, mq.connectionString, mq.maskedTarget, 0, publicationRetry)
-			mq.l.Info("Connecting to `{_target}` by publisher '{_publisher}'...", log.Data{
-				"_target":    log.Str(mq.maskedTarget),
-				"_publisher": log.Str(publisher),
-			})
-
-			err := c.connect()
-			if err != nil {
-				delay := mq.reconnectDelay()
-				mq.l.Error("Can't connect to '{_target}' by publisher '{_consumer}': {_publisher} (reconnect in {_reconnectTime}ms...)", log.Data{
-					"_target":        log.Str(mq.maskedTarget),
-					"_publisher":     log.Str(publisher),
-					"_error":         log.Err(err),
-					"_reconnectTime": log.Int(delay.Milliseconds()),
-				})
-				c.cleanup()
-				sleepCtx(context, delay)
-				continue
-			}
-
-			producerId := mq.getClientId(publisher)
-
-			connectionErrorCh := make(chan *amqp.Error)
-			c.conn.NotifyClose(connectionErrorCh)
-
-			mq.outputQueueLoop(outgoingPublicationChannel, connectionErrorCh, producerId, c, context)
-
-			publicationRetry = c.publicationRetry
-			c.cleanup()
 		}
 	}()
 

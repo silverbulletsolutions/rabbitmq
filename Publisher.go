@@ -8,6 +8,105 @@ import (
 	"github.com/silverbulletsolutions/log"
 )
 
+type Publication struct {
+	Exchange        string
+	Key             string
+	Headers         amqp.Table
+	CorrelationId   string
+	ContentEncoding string
+	ContentType     string
+	Body            []byte
+}
+
+type Publisher struct {
+	name                       string
+	outgoingPublicationChannel chan Publication
+	stopPublisher              context.CancelFunc
+	publisherCtx               context.Context
+	publisherShutdownChannel   chan struct{}
+}
+
+func (p *Publisher) Publish(ctx context.Context, publication Publication) error {
+	select {
+	case p.outgoingPublicationChannel <- publication:
+	case <-p.publisherCtx.Done():
+		return p.publisherCtx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (p *Publisher) Shutdown(ctx context.Context) {
+	p.stopPublisher()
+	select {
+	case <-p.publisherShutdownChannel:
+		// shutdown complete
+	case <-ctx.Done():
+		// may result panic
+	}
+	close(p.publisherShutdownChannel)
+}
+
+func newPublisher(mq *RabbitMQClient, publisher string) *Publisher {
+	publisherCtx, stopPublisher := context.WithCancel(context.Background())
+
+	p := &Publisher{
+		publisherCtx:  publisherCtx,
+		stopPublisher: stopPublisher,
+
+		outgoingPublicationChannel: make(chan Publication),
+		publisherShutdownChannel:   make(chan struct{}),
+	}
+
+	go func() {
+		var publicationRetry *Publication = nil
+		for {
+			if publisherCtx.Err() != nil {
+				mq.l.Info("Publish '{_target}' by publisher '{_publisher}' stopped: {_error}", log.Data{
+					"_target":    log.Str(mq.maskedTarget),
+					"_publisher": log.Str(publisher),
+					"_error":     log.Err(publisherCtx.Err()),
+				})
+				p.publisherShutdownChannel <- struct{}{}
+				return
+			}
+
+			c := newInternalRabbitMQConnection(mq.l, publisherCtx, mq.connectionString, mq.maskedTarget, 0, publicationRetry)
+			mq.l.Info("Connecting to `{_target}` by publisher '{_publisher}'...", log.Data{
+				"_target":    log.Str(mq.maskedTarget),
+				"_publisher": log.Str(publisher),
+			})
+
+			err := c.connect()
+			if err != nil {
+				delay := mq.reconnectDelay()
+				mq.l.Error("Can't connect to '{_target}' by publisher '{_consumer}': {_publisher} (reconnect in {_reconnectTime}ms...)", log.Data{
+					"_target":        log.Str(mq.maskedTarget),
+					"_publisher":     log.Str(publisher),
+					"_error":         log.Err(err),
+					"_reconnectTime": log.Int(delay.Milliseconds()),
+				})
+				c.cleanup()
+				sleepCtx(publisherCtx, delay)
+				continue
+			}
+
+			producerId := mq.getClientId(publisher)
+
+			connectionErrorCh := make(chan *amqp.Error)
+			c.conn.NotifyClose(connectionErrorCh)
+
+			mq.outputQueueLoop(p.outgoingPublicationChannel, connectionErrorCh, producerId, c, publisherCtx)
+
+			publicationRetry = c.publicationRetry
+			c.cleanup()
+		}
+	}()
+
+	return p
+}
+
 func (mq *RabbitMQClient) outputQueueLoop(outgoingPublicationChannel chan Publication, connectionErrorCh chan *amqp.Error, publisher string, c *internalRabbitMQConnection, context context.Context) {
 	if c.publicationRetry != nil {
 		msg := *c.publicationRetry
