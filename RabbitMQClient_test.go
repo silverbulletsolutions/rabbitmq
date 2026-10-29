@@ -362,6 +362,10 @@ func TestRabbitMQClient_MessageLoop(t *testing.T) {
 	inputEvents := mq.Consume(ctx, UseExistingQueue("archive.debug.queue"), "superConsumer", 10, true, nil)
 
 	outEvents := mq.Publish(ctx, "publisher")
+	outEvents <- Publication{
+		Key:  "archive.debug.queue",
+		Body: []byte("Hello, world!"),
+	}
 
 	msgCount := 0
 	totalBodySize := 0
