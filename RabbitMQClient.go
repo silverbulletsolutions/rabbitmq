@@ -62,11 +62,12 @@ func maskPassword(connectionString string) string {
 	return connectionString[:schemeEnd+3] + userInfo[:colon+1] + strings.Repeat("*", utf8.RuneCountInString(password)) + rest[at:]
 }
 
-// reconnectDelay returns reconnectTime with random jitter (0-50% of reconnectTime added)
+// reconnectDelay returns reconnectTime with random jitter (-25%..25% of reconnectTime added)
 func (mq *RabbitMQClient) reconnectDelay() time.Duration {
 	d := mq.reconnectTime
 	if d > 0 {
-		d += time.Duration(rand.Int64N(int64(d)/2 + 1))
+		half := int64(d / 2)
+		d += time.Duration(rand.Int64N(half+1) - half/2)
 	}
 	return d
 }
