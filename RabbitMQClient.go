@@ -213,7 +213,13 @@ func (mq *RabbitMQClient) Publish(ctx context.Context, publisher string) chan<- 
 				})
 
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), legacyPublishShutdownTimeout)
-				p.Shutdown(shutdownCtx)
+				if err := p.Shutdown(shutdownCtx); err != nil {
+					mq.l.Error("Shutdown of publisher '{_publisher}' on '{_target}' error: {_error}", log.Data{
+						"_target":    log.Str(mq.maskedTarget),
+						"_publisher": log.Str(publisher),
+						"_error":     log.Err(err),
+					})
+				}
 				cancel()
 
 				for msg := range outgoingPublicationChannel {

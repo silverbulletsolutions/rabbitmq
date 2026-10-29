@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -26,11 +27,33 @@ func newInternalRabbitMQConnection(l log.Logger, ctx context.Context, connection
 	return &internalRabbitMQConnection{l: l, ctx: ctx, connectionString: connectionString, maskedTarget: maskedTarget, prefetchCount: prefetchCount, publicationRetry: publicationRetry}
 }
 
+const dialTimeout = 30 * time.Second
+
 func (i *internalRabbitMQConnection) connect() error {
 	i.l.Info("Dial to {_rabbitmq}...", log.Data{"_rabbitmq": log.Str(i.maskedTarget)})
+
+	// ctx interrupts TCP dial and TLS/AMQP handshake
+	var stopHandshakeInterrupt func() bool
 	conn, err := amqp.DialConfig(i.connectionString, amqp.Config{
 		Heartbeat: 10 * time.Second,
+		Dial: func(network, addr string) (net.Conn, error) {
+			d := net.Dialer{Timeout: dialTimeout}
+			nc, err := d.DialContext(i.ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			// deadline for TLS and AMQP handshake (cleared by amqp091 when connection is established, as in amqp.DefaultDial)
+			if err := nc.SetDeadline(time.Now().Add(dialTimeout)); err != nil {
+				_ = nc.Close()
+				return nil, err
+			}
+			stopHandshakeInterrupt = context.AfterFunc(i.ctx, func() { _ = nc.SetDeadline(time.Now()) })
+			return nc, nil
+		},
 	})
+	if stopHandshakeInterrupt != nil {
+		stopHandshakeInterrupt()
+	}
 	if err != nil {
 		return fmt.Errorf("dial to '%s' error: %w", i.maskedTarget, err)
 	}
@@ -55,14 +78,18 @@ func (i *internalRabbitMQConnection) connect() error {
 	return nil
 }
 
-func (i *internalRabbitMQConnection) cleanup() {
+// cleanup closes channel and connection; returns channel close error (successful close of an open channel
+// means the broker has processed all frames published on it before)
+func (i *internalRabbitMQConnection) cleanup() error {
 	i.l.Info("Cleanup on {_id}...", log.Data{"_id": log.Str(i.maskedTarget)})
+	var err error
 	if i.ch != nil {
-		_ = i.ch.Close()
+		err = i.ch.Close()
 		i.ch = nil
 	}
 	if i.conn != nil {
 		_ = i.conn.Close()
 		i.conn = nil
 	}
+	return err
 }
