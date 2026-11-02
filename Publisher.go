@@ -37,6 +37,15 @@ const (
 	MandatoryOff
 )
 
+// DeliveryMode of a published message. Zero value means "publisher default" (WithPersistent).
+type DeliveryMode uint8
+
+const (
+	DeliveryModeDefault DeliveryMode = iota
+	DeliveryModeTransient
+	DeliveryModePersistent
+)
+
 type Publication struct {
 	Exchange        string
 	Key             string
@@ -46,7 +55,8 @@ type Publication struct {
 	ContentType     string
 	Body            []byte
 
-	Mandatory Mandatory // MandatoryDefault - publisher default (WithMandatory)
+	Mandatory    Mandatory    // MandatoryDefault - publisher default (WithMandatory)
+	DeliveryMode DeliveryMode // DeliveryModeDefault - publisher default (WithPersistent)
 }
 
 const (
@@ -59,6 +69,7 @@ const (
 type publisherOptions struct {
 	confirms    bool
 	mandatory   bool
+	persistent  bool
 	maxInFlight int
 }
 
@@ -74,6 +85,13 @@ func WithoutConfirms() PublisherOption {
 // mandatory message returns ErrUnroutable (without confirms it is only logged).
 func WithMandatory(mandatory bool) PublisherOption {
 	return func(o *publisherOptions) { o.mandatory = mandatory }
+}
+
+// WithPersistent sets default delivery mode (default: false - transient). A persistent message routed to a durable
+// queue survives broker restart; with confirms enabled the broker confirms it after it has been written to disk
+// (quorum queues: replicated to a majority of nodes). Transient messages are lost on broker restart.
+func WithPersistent(persistent bool) PublisherOption {
+	return func(o *publisherOptions) { o.persistent = persistent }
 }
 
 // WithMaxInFlight sets max number of sent but not yet confirmed messages (default: 256).
@@ -452,6 +470,18 @@ func (p *Publisher) send(s *publisherSession, req *publishRequest) error {
 		mandatory = false
 	}
 
+	persistent := p.opts.persistent
+	switch msg.DeliveryMode {
+	case DeliveryModePersistent:
+		persistent = true
+	case DeliveryModeTransient:
+		persistent = false
+	}
+	deliveryMode := amqp.Transient
+	if persistent {
+		deliveryMode = amqp.Persistent
+	}
+
 	headers := msg.Headers
 	if mandatory && p.opts.confirms {
 		headers = make(amqp.Table, len(msg.Headers)+1)
@@ -470,7 +500,7 @@ func (p *Publisher) send(s *publisherSession, req *publishRequest) error {
 		Headers:         headers,
 		ContentType:     msg.ContentType,
 		ContentEncoding: msg.ContentEncoding,
-		DeliveryMode:    amqp.Transient,
+		DeliveryMode:    deliveryMode,
 		CorrelationId:   msg.CorrelationId,
 		AppId:           s.id,
 		Body:            msg.Body,

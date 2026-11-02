@@ -288,6 +288,45 @@ func TestPublisher_Unroutable(t *testing.T) {
 	}
 }
 
+func TestPublisher_DeliveryMode(t *testing.T) {
+	ch, queueName := testQueue(t)
+	mq := NewRabbitMQClient(log.NewConsoleLogger(log.LogLevelWarn), "guest:guest@"+testBrokerAddr, 100*time.Millisecond, "test-client")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	transient := mq.NewPublisher("transient")
+	persistent := mq.NewPublisher("persistent", WithPersistent(true))
+	defer func() { _ = transient.Shutdown(context.Background()) }()
+	defer func() { _ = persistent.Shutdown(context.Background()) }()
+
+	publications := []struct {
+		p    *Publisher
+		mode DeliveryMode
+		want uint8
+	}{
+		{transient, DeliveryModeDefault, amqp.Transient},
+		{transient, DeliveryModePersistent, amqp.Persistent},
+		{persistent, DeliveryModeDefault, amqp.Persistent},
+		{persistent, DeliveryModeTransient, amqp.Transient},
+	}
+	for i, pub := range publications {
+		if err := pub.p.Publish(ctx, Publication{Key: queueName, Body: []byte(strconv.Itoa(i)), DeliveryMode: pub.mode}); err != nil {
+			t.Fatalf("Publish %d: %v", i, err)
+		}
+	}
+
+	for i, pub := range publications {
+		d, ok, err := ch.Get(queueName, true)
+		if err != nil || !ok {
+			t.Fatalf("Get %d: ok %v, error %v", i, ok, err)
+		}
+		if string(d.Body) != strconv.Itoa(i) || d.DeliveryMode != pub.want {
+			t.Errorf("message %s: delivery mode %d, expected message %d with delivery mode %d", d.Body, d.DeliveryMode, i, pub.want)
+		}
+	}
+}
+
 func TestPublisher_ChannelException(t *testing.T) {
 	ch, queueName := testQueue(t)
 	mq := NewRabbitMQClient(log.NewConsoleLogger(log.LogLevelWarn), "guest:guest@"+testBrokerAddr, 100*time.Millisecond, "test-client")

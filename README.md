@@ -94,10 +94,20 @@ utrzymuje połączenie i goroutine do końca działania programu.
 |---|---|---|
 | `WithoutConfirms()` | potwierdzenia włączone | `Publish` kończy się po zapisaniu wiadomości do socketu; przy zerwaniu połączenia wiadomość może zginąć bez błędu |
 | `WithMandatory(bool)` | `false` | domyślna flaga `mandatory`: wiadomość, której nie da się skierować do żadnej kolejki, kończy się `ErrUnroutable` zamiast zniknąć po cichu |
+| `WithPersistent(bool)` | `false` | domyślny tryb dostarczenia: wiadomość trwała (`true`) przetrwa restart brokera, jeśli trafi do trwałej kolejki – broker potwierdza ją dopiero po zapisie na dysk |
 | `WithMaxInFlight(n)` | `256` | maksymalna liczba wysłanych, a jeszcze niepotwierdzonych wiadomości; po osiągnięciu limitu kolejne czekają |
 
 Flagę `mandatory` można zmienić dla pojedynczej wiadomości polem `Publication.Mandatory`
 (`MandatoryOn` / `MandatoryOff`; zero – `MandatoryDefault` – oznacza ustawienie publishera).
+Analogicznie tryb dostarczenia zmienia pole `Publication.DeliveryMode` (`DeliveryModePersistent` / `DeliveryModeTransient`).
+
+### Trwałość wiadomości
+
+Wiadomość przetrwa restart brokera tylko wtedy, gdy jest trwała (`WithPersistent(true)` lub `DeliveryModePersistent`)
+**i** trafia do trwałej kolejki (`durable`, np. kolejka quorum). Dla takiej wiadomości potwierdzenie przychodzi
+po zapisie na dysk (kolejka quorum: po replikacji na większość węzłów), więc `Publish` zwracające `nil` oznacza,
+że restart brokera jej nie usunie. Trwała wiadomość w nietrwałej kolejce ginie razem z kolejką.
+Zapis na dysk wydłuża czas potwierdzenia.
 
 ### Wynik `Publish`
 
@@ -130,7 +140,7 @@ połączenie jest zamykane natychmiast, a `Shutdown` zwraca błąd `ctx`. `Shutd
 
 ### Uwagi
 
-- Wiadomości są wysyłane jako nietrwałe (`DeliveryMode: Transient`) – nie przetrwają restartu brokera nawet w trwałej kolejce.
+- Domyślnie wiadomości są wysyłane jako nietrwałe (`Transient`) – nie przetrwają restartu brokera nawet w trwałej kolejce.
 - Wiadomości z `mandatory` (przy włączonych potwierdzeniach) dostają nagłówek `x-publish-id`, służący do powiązania zwrotu z wywołaniem `Publish`. Konsumenci go widzą.
 - Kolejne wywołania `Publish` z jednej goroutine są ograniczone opóźnieniem potwierdzenia brokera (jedno potwierdzenie na wywołanie). Dla dużej przepustowości publikuj współbieżnie – do `WithMaxInFlight` wiadomości jest w drodze jednocześnie.
 
@@ -146,6 +156,79 @@ Zachowane dla zgodności wstecz; działa na `Publisher` z domyślnymi opcjami:
 - wysłanie do kanału czeka na przyjęcie wiadomości, ale nie na potwierdzenie; błędy publikacji są tylko logowane;
 - po zakończeniu `ctx` wiadomości przyjęte wcześniej są wysyłane w ramach 5-sekundowego `Shutdown`;
 - kanał nigdy nie jest zamykany (wysyłający dostawaliby panic) – wiadomości wysłane po zakończeniu `ctx` są odrzucane i logowane.
+
+---
+
+## Migracja z `RabbitMQClient.Publish` na `Publisher`
+
+### Zmiany zachowania bez zmiany kodu
+
+Kod używający `client.Publish(ctx, name)` kompiluje się i działa dalej, ale zachowuje się inaczej niż wcześniej:
+
+| | wcześniej | teraz |
+|---|---|---|
+| wysłanie do kanału po zakończeniu `ctx` | panic (kanał był zamykany) | wiadomość odrzucona i zalogowana |
+| zerwanie połączenia | ponawiana tylko wiadomość, której zapis do socketu się nie powiódł; wiadomości zapisane w martwe łącze ginęły bez śladu | ponawiane wszystkie wiadomości niepotwierdzone przez brokera (możliwe duplikaty) |
+| zakończenie `ctx` | połączenie zamykane od razu | przyjęte wiadomości są wysyłane i potwierdzane w ramach 5-sekundowego zamykania |
+| nieistniejący exchange | broker zamykał kanał; wiadomości wysłane, zanim klient to wykrył, ginęły bez śladu | błąd `ErrChannelClosed` logowany dla każdej z nich |
+| błędy publikacji | niewidoczne dla wołającego | nadal niewidoczne – tylko logowane |
+
+### Krok 1 – jeden publisher na czas życia aplikacji
+
+Utwórz publisher raz przy starcie (nie na każdy request) i przekaż go tam, gdzie wcześniej przekazywany był kanał:
+
+```go
+// przed
+pubCh := client.Publish(ctx, "order-publisher")
+
+// po
+pub := client.NewPublisher("order-publisher") // opcjonalnie: WithMandatory(true), WithPersistent(true)
+```
+
+### Krok 2 – `Publish` zamiast wysłania do kanału
+
+```go
+// przed
+pubCh <- rabbitmq.Publication{Exchange: "orders", Key: "order.created", Body: body}
+
+// po
+if err := pub.Publish(ctx, rabbitmq.Publication{Exchange: "orders", Key: "order.created", Body: body}); err != nil {
+    return fmt.Errorf("publish order.created: %w", err)
+}
+```
+
+- `Publish` czeka na potwierdzenie brokera – błąd można zwrócić klientowi, ponowić albo zalogować.
+- `ctx` ogranicza czas oczekiwania (także na ponowne połączenie). W handlerze HTTP `r.Context()` oznacza,
+  że rozłączenie klienta przerywa publikację; jeśli wiadomość ma wyjść niezależnie od klienta, użyj
+  `context.WithTimeout(context.WithoutCancel(r.Context()), ...)`.
+- Kolejne `Publish` z jednej goroutine czekają każde na swoje potwierdzenie. Jeśli kod wysyłał w pętli wiele
+  wiadomości, publikuj je współbieżnie (np. `errgroup`), żeby nie płacić opóźnienia potwierdzenia za każdą osobno.
+- Jeśli wynik naprawdę nie jest potrzebny (*fire-and-forget*), wywołaj `Publish` w osobnej goroutine i zaloguj błąd –
+  ale wtedy goroutine muszą zakończyć się przed `Shutdown` (patrz krok 3).
+
+### Krok 3 – zamykanie
+
+Zamiast anulowania `ctx` przekazanego do `client.Publish` wywołaj `Shutdown` – **dopiero gdy nikt już nie publikuje**.
+Wywołanie `Publish` po (lub w trakcie) `Shutdown` zwraca `ErrPublisherClosed`, nawet jeśli zaczęło się wcześniej,
+ale wiadomość nie została jeszcze przyjęta.
+
+W serwerze HTTP kolejność jest następująca:
+
+```go
+// 1. przestań przyjmować requesty i poczekaj na trwające
+if err := srv.Shutdown(srvCtx); err != nil {
+    _ = srv.Close() // termin minął - zerwij połączenia (anuluje r.Context())
+    // poczekaj chwilę na handlery, które jeszcze publikują (np. własny sync.WaitGroup)
+}
+
+// 2. wszystkie Publish się zakończyły - zamknij publisher
+if err := pub.Shutdown(pubCtx); err != nil {
+    logger.Error("Publisher shutdown: {_error}", log.Data{"_error": log.Err(err)})
+}
+```
+
+`srv.Shutdown` nie czeka na goroutine uruchomione z handlerów ani na połączenia przejęte przez `Hijack` –
+jeśli publikują, trzeba poczekać na nie samodzielnie przed `pub.Shutdown`.
 
 ---
 
