@@ -96,6 +96,10 @@ func (mq *RabbitMQClient) getClientId(consumer string) string {
 	return fmt.Sprintf("%s-%s#%d", mq.clientName, consumer, clientId)
 }
 
+// Consume returns channel with messages from the queue; it is closed when context is done.
+//
+// Deprecated: use NewConsumer - it supports concurrent handlers, acknowledges messages by handler result
+// and shuts down gracefully (handlers finish and acknowledge their messages before the connection is closed).
 func (mq *RabbitMQClient) Consume(context context.Context, queue RabbitMQQueue, consumer string, prefetchCount int, autoAck bool, args amqp.Table) <-chan amqp.Delivery {
 
 	outgoingResponseChannel := make(chan amqp.Delivery)
@@ -178,6 +182,12 @@ func (mq *RabbitMQClient) Consume(context context.Context, queue RabbitMQQueue, 
 // NewPublisher creates a publisher and starts connecting in background. The publisher must be stopped with Shutdown.
 func (mq *RabbitMQClient) NewPublisher(name string, opts ...PublisherOption) *Publisher {
 	return newPublisher(mq, name, opts...)
+}
+
+// NewConsumer creates a consumer of the queue; consumption starts with Start. The consumer must be stopped with Shutdown.
+// Returns error only for invalid configuration (broker is not contacted).
+func (mq *RabbitMQClient) NewConsumer(name string, queue RabbitMQQueue, handler Handler, opts ...ConsumerOption) (*Consumer, error) {
+	return newConsumer(mq, name, queue, handler, opts...)
 }
 
 // legacyPublishShutdownTimeout bounds sending of messages accepted before context of Publish was done
