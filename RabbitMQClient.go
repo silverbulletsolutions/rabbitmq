@@ -112,7 +112,7 @@ func (mq *RabbitMQClient) Consume(context context.Context, queue RabbitMQQueue, 
 				return
 			}
 
-			c := newInternalRabbitMQConnection(mq.l, context, mq.connectionString, mq.maskedTarget, prefetchCount, nil)
+			c := newInternalRabbitMQConnection(mq.l, context, mq.connectionString, mq.maskedTarget, prefetchCount)
 			mq.l.Info("Connecting to `{_target}` by consumer '{_consumer}'...", log.Data{
 				"_target":   log.Str(mq.maskedTarget),
 				"_consumer": log.Str(consumer),
@@ -175,8 +175,9 @@ func (mq *RabbitMQClient) Consume(context context.Context, queue RabbitMQQueue, 
 	return outgoingResponseChannel
 }
 
-func (mq *RabbitMQClient) NewPublisher(name string) *Publisher {
-	return newPublisher(mq, name)
+// NewPublisher creates a publisher and starts connecting in background. The publisher must be stopped with Shutdown.
+func (mq *RabbitMQClient) NewPublisher(name string, opts ...PublisherOption) *Publisher {
+	return newPublisher(mq, name, opts...)
 }
 
 // legacyPublishShutdownTimeout bounds sending of messages accepted before context of Publish was done
@@ -195,16 +196,18 @@ func (mq *RabbitMQClient) Publish(ctx context.Context, publisher string) chan<- 
 		for {
 			select {
 			case msg := <-outgoingPublicationChannel:
-				err := p.Publish(ctx, msg)
+				// accepted messages are sent (and confirmed) also after ctx is done - within Shutdown timeout;
+				// results are awaited asynchronously, so many messages can be in flight (as before confirms)
+				result, err := p.submit(ctx, context.WithoutCancel(ctx), msg)
 				if err != nil {
-					mq.l.Error("Publish message '{correlationId}' to '{_target}' exchange '{_exchange}' by publisher '{_publisher}' error: {_error}", log.Data{
-						"_target":       log.Str(mq.maskedTarget),
-						"_publisher":    log.Str(publisher),
-						"_exchange":     log.Str(msg.Exchange),
-						"_error":        log.Err(err),
-						"correlationId": log.Str(msg.CorrelationId),
-					})
+					mq.logLegacyPublishError(publisher, msg, err)
+					continue
 				}
+				go func() {
+					if err := <-result; err != nil {
+						mq.logLegacyPublishError(publisher, msg, err)
+					}
+				}()
 			case <-ctx.Done():
 				mq.l.Info("Publish '{_target}' by publisher '{_publisher}' stopped: {_error}", log.Data{
 					"_target":    log.Str(mq.maskedTarget),
@@ -235,4 +238,14 @@ func (mq *RabbitMQClient) Publish(ctx context.Context, publisher string) chan<- 
 	}()
 
 	return outgoingPublicationChannel
+}
+
+func (mq *RabbitMQClient) logLegacyPublishError(publisher string, msg Publication, err error) {
+	mq.l.Error("Publish message '{correlationId}' to '{_target}' exchange '{_exchange}' by publisher '{_publisher}' error: {_error}", log.Data{
+		"_target":       log.Str(mq.maskedTarget),
+		"_publisher":    log.Str(publisher),
+		"_exchange":     log.Str(msg.Exchange),
+		"_error":        log.Err(err),
+		"correlationId": log.Str(msg.CorrelationId),
+	})
 }

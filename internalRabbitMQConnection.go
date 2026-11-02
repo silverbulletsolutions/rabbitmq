@@ -19,12 +19,10 @@ type internalRabbitMQConnection struct {
 	connectionString string
 	maskedTarget     string
 	prefetchCount    int
-
-	publicationRetry *Publication
 }
 
-func newInternalRabbitMQConnection(l log.Logger, ctx context.Context, connectionString string, maskedTarget string, prefetchCount int, publicationRetry *Publication) *internalRabbitMQConnection {
-	return &internalRabbitMQConnection{l: l, ctx: ctx, connectionString: connectionString, maskedTarget: maskedTarget, prefetchCount: prefetchCount, publicationRetry: publicationRetry}
+func newInternalRabbitMQConnection(l log.Logger, ctx context.Context, connectionString string, maskedTarget string, prefetchCount int) *internalRabbitMQConnection {
+	return &internalRabbitMQConnection{l: l, ctx: ctx, connectionString: connectionString, maskedTarget: maskedTarget, prefetchCount: prefetchCount}
 }
 
 const dialTimeout = 30 * time.Second
