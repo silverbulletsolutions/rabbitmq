@@ -13,8 +13,8 @@ ponownie po awarii, a publisher z potwierdzeniami (*publisher confirms*) zgłasz
 - **Automatyczny reconnect** – konsument i publisher wznawiają zerwane połączenie i kanał po `reconnectTime` (z losowym rozrzutem ±25%).
 - **Publikacja z potwierdzeniem** – `Publisher.Publish` zwraca `nil` dopiero po potwierdzeniu przyjęcia wiadomości przez brokera; wiadomości niepotwierdzone przed zerwaniem połączenia są wysyłane ponownie (*at-least-once*).
 - **Błędy zwracane wołającemu** – brak trasy (`ErrUnroutable`), odrzucenie przez brokera (`ErrNacked`), zamknięcie kanału (`ErrChannelClosed`), blokada połączenia (`ErrConnectionBlocked`).
-- **Graceful shutdown** – `Publisher.Shutdown(ctx)` w modelu `http.Server`: wysyła i czeka na potwierdzenie wszystkiego, co zostało przyjęte, a po upływie `ctx` kończy natychmiast.
-- **Kanałowe API konsumenta** – wiadomości odbierane z `<-chan amqp.Delivery`.
+- **Graceful shutdown** w modelu `http.Server` – `Publisher.Shutdown(ctx)` wysyła i czeka na potwierdzenie wszystkiego, co zostało przyjęte; `Consumer.Shutdown(ctx)` przestaje pobierać wiadomości i czeka, aż handlery obsłużą pobrane. Po upływie `ctx` oba kończą natychmiast.
+- **Konsument z handlerem** – `Handler` / `HandlerFunc` jak w `net/http`, współbieżna obsługa (`WithConcurrency`), potwierdzanie według wyniku handlera, przechwytywanie panic.
 - **Kolejki** – `UseExistingQueue` (istniejąca kolejka) i `UseTemporaryQueue` (deklaracja kolejki tymczasowej z powiązaniami).
 - **Bezpieczne logowanie** – hasło z connection stringa jest w logach zamieniane na `*` (tyle gwiazdek, ile znaków ma hasło).
 
@@ -232,13 +232,120 @@ jeśli publikują, trzeba poczekać na nie samodzielnie przed `pub.Shutdown`.
 
 ---
 
-## Konsumpcja – `Consume`
+## Konsumpcja – `Consumer`
+
+```go
+c, err := client.NewConsumer("order-consumer", rabbitmq.UseExistingQueue("orders.incoming"),
+    rabbitmq.HandlerFunc(func(ctx context.Context, d *rabbitmq.Delivery) error {
+        return processOrder(ctx, d.Body) // nil → Ack, błąd → Nack (bez ponownego wstawienia)
+    }),
+    rabbitmq.WithConcurrency(8),
+)
+if err != nil {
+    return err // tylko błędna konfiguracja - broker nie jest kontaktowany
+}
+if err := c.Start(); err != nil { // łączy się i konsumuje w tle
+    return err
+}
+
+// przy zamykaniu aplikacji
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := c.Shutdown(ctx); err != nil {
+    logger.Error("Consumer shutdown: {_error}", log.Data{"_error": log.Err(err)})
+}
+```
+
+- `NewConsumer` niczego nie uruchamia – konsumpcja zaczyna się dopiero od `Start()`, więc aplikacja decyduje,
+  kiedy jest gotowa na wiadomości (np. po połączeniu z bazą). Kolejne wywołania `Start()` nic nie robią,
+  a po `Shutdown` zwraca ono `ErrConsumerClosed`.
+- `NewConsumer` zwraca błąd tylko przy błędnej konfiguracji. Brak kolejki czy niedostępny broker nie są błędem
+  konstruktora – konsument ponawia próby w tle i loguje błędy.
+- Konsument, który został uruchomiony i nie został zamknięty przez `Shutdown`, utrzymuje połączenie
+  i goroutine do końca działania programu.
+
+### `Handler`
+
+```go
+type Handler interface {
+    HandleDelivery(ctx context.Context, d *Delivery) error
+}
+
+type HandlerFunc func(ctx context.Context, d *Delivery) error
+```
+
+Tak jak w `net/http`, handler można opakowywać w middleware (`func(Handler) Handler`) – np. logowanie, metryki,
+tracing, odrzucanie duplikatów po `MessageId`.
+
+`ctx` handlera jest anulowany dopiero wtedy, gdy minie termin `Shutdown` – długie przetwarzanie powinno go sprawdzać.
+
+### Potwierdzanie wiadomości
+
+`Delivery` zawiera pola wiadomości (`Body`, `Headers`, `CorrelationId`, `MessageId`, `Redelivered`, ...)
+oraz metody `Ack()` i `Nack(requeue bool)`. Jeśli handler sam ich nie wywoła, o potwierdzeniu decyduje jego wynik:
+
+| wynik handlera | akcja |
+|---|---|
+| `nil` | `Ack` – broker usuwa wiadomość z kolejki |
+| błąd | `Nack` bez ponownego wstawienia – wiadomość trafia do kolejki martwych wiadomości (DLX), jeśli kolejka ją ma, w przeciwnym razie jest usuwana |
+| panic | przechwycony (jak w `net/http`), zalogowany ze stosem; po `WithPanicRequeueDelay` (domyślnie 1 s) `Nack` z ponownym wstawieniem |
+| handler wywołał `Ack` / `Nack` | wynik handlera jest tylko logowany (jeśli to błąd) |
+
+- `Ack` / `Nack` działają raz – kolejne wywołanie zwraca `ErrAlreadyAcknowledged` i nie trafia do brokera
+  (podwójne potwierdzenie spowodowałoby zamknięcie kanału przez brokera).
+- Decyzję trzeba podjąć **przed powrotem z handlera** – po powrocie biblioteka potwierdza wiadomość według wyniku.
+- Żeby błąd chwilowy (np. niedostępna baza) nie odrzucał wiadomości, wywołaj `d.Nack(true)` – wiadomość wróci do kolejki.
+- Panic jest zwracany middleware jako `*PanicError` (pola `Value` i `Stack`).
+- Panic w goroutine uruchomionej przez handler nie jest przechwytywany i kończy proces – tak samo jak w `net/http`.
+
+**Wiadomość, która zawsze powoduje panic**, wraca do kolejki co `WithPanicRequeueDelay` – nie ginie, ale:
+
+- zajmuje workera; przy `WithConcurrency(1)` blokuje całą kolejkę, bo RabbitMQ wstawia ją z powrotem na początek,
+- kolejki quorum w RabbitMQ 4.x mają domyślny limit 20 dostarczeń (`delivery-limit`) – po jego przekroczeniu
+  wiadomość trafia do DLX, a **bez DLX jest usuwana**. Kolejki klasyczne nie mają limitu.
+
+### Opcje
+
+| opcja | domyślnie | znaczenie |
+|---|---|---|
+| `WithConcurrency(n)` | `1` | liczba handlerów działających równolegle; `1` zachowuje kolejność przetwarzania |
+| `WithPrefetch(n)` | `concurrency` | maksymalna liczba pobranych, a niepotwierdzonych wiadomości; nie może być mniejsza niż `concurrency` |
+| `WithPanicRequeueDelay(d)` | `1s` | czas oczekiwania przed ponownym wstawieniem wiadomości po panic (ogranicza liczbę ponowień i błędów w logu) |
+| `WithAutoAck()` | wyłączone | broker uznaje wiadomość za dostarczoną w chwili wysłania (patrz niżej) |
+| `WithConsumerArgs(args)` | `nil` | argumenty `basic.consume` (np. `x-priority`) |
+
+**`WithAutoAck()`** oznacza dostarczenie najwyżej raz: `Ack` / `Nack` nic nie robią, błędy i panic są tylko logowane,
+broker ignoruje `prefetch` i wysyła wiadomości bez ograniczeń, a wiadomości pobrane, lecz jeszcze nieobsłużone
+**giną** przy `Shutdown`, zerwaniu połączenia lub awarii procesu.
+
+### Zamykanie – `Shutdown(ctx)`
+
+1. Subskrypcja jest anulowana (`basic.cancel`) – broker przestaje dostarczać wiadomości.
+2. Wiadomości już pobrane (do `prefetch`) są jeszcze przekazywane handlerom.
+3. `Shutdown` czeka, aż handlery skończą i potwierdzą wiadomości (oczekiwanie po panic jest przerywane – wiadomość wraca do kolejki od razu).
+4. Kanał i połączenie są zamykane, `Shutdown` zwraca `nil`.
+
+Jeśli `ctx` zakończy się wcześniej, `ctx` handlerów jest anulowany, połączenie zamykane natychmiast, a niepotwierdzone
+wiadomości wracają do kolejki (handler, który zwróci wtedy błąd, nie odrzuca wiadomości). `Shutdown` zwraca błąd `ctx`
+**bez czekania na handlery** – tak jak `http.Server`. `Done()` jest zamykany, gdy wszystkie handlery wrócą.
+
+`Shutdown` można wywołać wielokrotnie, także przed `Start`.
+
+### Zachowanie przy awariach
+
+- **Brak połączenia, brak kolejki, błąd `basic.consume`** – konsument ponawia próby co `reconnectTime` i loguje błędy.
+- **Zerwanie połączenia, zamknięcie kanału, anulowanie subskrypcji przez brokera** (np. usunięcie kolejki) –
+  konsument łączy się ponownie i wznawia odbiór.
+- **Wiadomości obsługiwane w chwili zerwania połączenia** nie dadzą się już potwierdzić (błąd potwierdzenia jest logowany) –
+  broker dostarczy je ponownie z `Redelivered: true`. Przetwarzanie powinno być więc idempotentne.
+
+### `RabbitMQClient.Consume` (przestarzałe)
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 
-deliveries := client.Consume(
+deliveries := client.Consume( // Deprecated: użyj NewConsumer
     ctx,
     rabbitmq.UseExistingQueue("orders.incoming"),
     "order-consumer", // nazwa konsumenta (consumer tag: clientName-nazwa#numer)
@@ -257,8 +364,34 @@ for msg := range deliveries {
 - Po zerwaniu połączenia (lub błędzie deklaracji kolejki / `basic.consume`) konsument łączy się ponownie, ponownie inicjalizuje kolejkę i wznawia odbiór.
 - Wiadomości odebrane przed zerwaniem połączenia nie mogą już zostać potwierdzone (`Ack` zwraca błąd) – broker dostarczy je ponownie z `Redelivered: true`.
 - Kanał `deliveries` jest niebuforowany – wolne przetwarzanie wstrzymuje odbiór (liczbę wiadomości po stronie klienta ogranicza `prefetchCount`).
+- Brak kontrolowanego zamknięcia: po zakończeniu `ctx` połączenie jest zamykane od razu, więc wiadomości w trakcie
+  przetwarzania nie dadzą się potwierdzić i zostaną dostarczone ponownie.
 
-### Kolejki (`RabbitMQQueue`)
+Przejście na `Consumer`:
+
+```go
+// przed
+for msg := range client.Consume(ctx, queue, "order-consumer", 20, false, nil) {
+    if err := process(msg.Body); err != nil {
+        _ = msg.Nack(false, false)
+        continue
+    }
+    _ = msg.Ack(false)
+}
+
+// po
+c, err := client.NewConsumer("order-consumer", queue,
+    rabbitmq.HandlerFunc(func(ctx context.Context, d *rabbitmq.Delivery) error {
+        return process(d.Body)
+    }),
+    rabbitmq.WithPrefetch(20),
+)
+// ... c.Start(), a przy zamykaniu c.Shutdown(ctx) zamiast anulowania ctx
+```
+
+---
+
+## Kolejki (`RabbitMQQueue`)
 
 Kolejka jest inicjalizowana przy każdym nawiązaniu połączenia:
 
@@ -274,8 +407,11 @@ q := rabbitmq.UseTemporaryQueue("notifications-worker").
     BindWithKey("events.topic", "user.created", nil).
     BindWithKey("events.topic", "user.updated", nil)
 
-deliveries := client.Consume(ctx, q, "notify-consumer", 10, true, nil)
+c, err := client.NewConsumer("notify-consumer", q, handler)
 ```
+
+Kolejka tymczasowa (`exclusive`, `autoDelete`) jest usuwana przy zerwaniu połączenia i tworzona od nowa po reconnect –
+wiadomości, które w niej czekały, giną. Do danych, których nie wolno zgubić, używaj trwałej kolejki (`UseExistingQueue`).
 
 > **RabbitMQ 4.x:** nietrwałe kolejki niewyłączne są wycofane (*deprecated feature* `transient_nonexcl_queues`)
 > i domyślnie zabronione. `UseTemporaryQueue(...).NoExclusive()` kończy się wtedy błędem deklaracji,
@@ -292,5 +428,6 @@ docker run -d --name rabbitmq -p 5672:5672 rabbitmq:4
 go test -count=1 -v .
 ```
 
-Testy zerwania połączenia (`PublisherReconnect_test.go`) łączą się z brokerem przez lokalny proxy TCP, który symuluje
-zerwanie połączeń, niedostępność brokera i martwe łącze. Gdy broker jest niedostępny, testy te są pomijane.
+Testy zerwania połączenia (`PublisherReconnect_test.go`, `TestConsumer_Reconnect`) łączą się z brokerem przez lokalny
+proxy TCP, który symuluje zerwanie połączeń, niedostępność brokera i martwe łącze. Gdy broker jest niedostępny,
+testy wymagające brokera są pomijane.
